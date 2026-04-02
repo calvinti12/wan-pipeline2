@@ -39,6 +39,20 @@ class WANModel:
         self.vae = None
         self.t2v_model_id = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
         self.i2v_model_id = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+        model_root = os.environ.get("MODEL_ROOT", "/runpod-volume/models")
+        self.t2v_model_path = os.environ.get(
+            "T2V_MODEL_PATH",
+            f"{model_root}/Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        )
+        self.i2v_model_path = os.environ.get(
+            "I2V_MODEL_PATH",
+            f"{model_root}/Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        )
+        self.i2v_first_last_model_path = os.environ.get(
+            "I2V_FIRST_LAST_MODEL_PATH",
+            self.i2v_model_path,
+        )
+        self.local_models_only = os.environ.get("WAN_LOCAL_MODELS_ONLY", "1") == "1"
         self.instagirl_lora_path = instagirl_lora_path
         self.dtype = torch.bfloat16
         self.current_model = None  # Track which model is currently loaded
@@ -46,6 +60,19 @@ class WANModel:
     def load_model(self):
         """Initialize model - no longer pre-loads models to save memory"""
         logger.info("WAN Model wrapper initialized - models will be loaded on-demand")
+
+    def _resolve_model_source(self, local_path: str, hf_model_id: str) -> str:
+        local_model_index = Path(local_path) / "model_index.json"
+        if local_model_index.exists():
+            logger.info(f"Using local model path: {local_path}")
+            return local_path
+        if self.local_models_only:
+            raise RuntimeError(
+                f"Local model missing at {local_path}. "
+                "Set up persistent models or set WAN_LOCAL_MODELS_ONLY=0 to allow HF download fallback."
+            )
+        logger.warning(f"Local model not found at {local_path}, falling back to HF model id: {hf_model_id}")
+        return hf_model_id
         
     def _cleanup_memory(self):
         """Clean up GPU memory by unloading models and running garbage collection"""
@@ -89,11 +116,13 @@ class WANModel:
             gc.collect()
             torch.cuda.empty_cache()
         
+        t2v_source = self._resolve_model_source(self.t2v_model_path, self.t2v_model_id)
+
         # Load VAE for T2V model if not already loaded
         if self.vae is None:
             logger.info("Loading VAE...")
             self.vae = AutoencoderKLWan.from_pretrained(
-                self.t2v_model_id, 
+                t2v_source,
                 subfolder="vae", 
                 torch_dtype=torch.float32
             )
@@ -101,7 +130,7 @@ class WANModel:
         # Load T2V pipeline
         logger.info("Loading T2V pipeline...")
         self.t2v_pipeline = WanPipeline.from_pretrained(
-            self.t2v_model_id, 
+            t2v_source,
             vae=self.vae,
             torch_dtype=self.dtype
         )
@@ -144,10 +173,12 @@ class WANModel:
             gc.collect()
             torch.cuda.empty_cache()
         
+        i2v_source = self._resolve_model_source(self.i2v_model_path, self.i2v_model_id)
+
         # Load I2V pipeline
         logger.info("Loading I2V pipeline...")
         self.i2v_pipeline = WanImageToVideoPipeline.from_pretrained(
-            self.i2v_model_id, 
+            i2v_source,
             torch_dtype=self.dtype
         )
         self.i2v_pipeline.to(self.device)
@@ -160,7 +191,8 @@ class WANModel:
             logger.info("Downloading and loading high-noise LoRA to transformer...")
             hi_path = hf_hub_download(
                 "lightx2v/Wan2.2-Lightning",
-                "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors"
+                "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors",
+                local_files_only=self.local_models_only,
             )
             self.i2v_pipeline.load_lora_weights(hi_path)  # applies to pipe.transformer
             
@@ -168,7 +200,8 @@ class WANModel:
             logger.info("Downloading and loading low-noise LoRA to transformer_2...")
             lo_path = hf_hub_download(
                 "lightx2v/Wan2.2-Lightning",
-                "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors"
+                "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors",
+                local_files_only=self.local_models_only,
             )
             state = st.load_file(lo_path)
             state = _convert_non_diffusers_wan_lora_to_diffusers(state)
@@ -203,27 +236,35 @@ class WANModel:
             gc.collect()
             torch.cuda.empty_cache()
         
+        i2v_first_last_source = self._resolve_model_source(
+            self.i2v_first_last_model_path,
+            self.i2v_model_id,
+        )
+
         # Load I2V pipeline
         logger.info("Loading I2V pipeline for first-last frame...")
         self.i2v_first_last_pipeline = WanImageToVideoPipeline.from_pretrained(
-            self.i2v_model_id,
+            i2v_first_last_source,
             torch_dtype=self.dtype
         )
         self.i2v_first_last_pipeline.to(self.device)
         
         # Load and fuse Lightning LoRA adapters following HF Space configuration
         logger.info("Loading/fusing Lightning LoRA adapters...")
+        fused_lora_path = hf_hub_download(
+            "Kijai/WanVideo_comfy",
+            "Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16.safetensors",
+            local_files_only=self.local_models_only,
+        )
         self.i2v_first_last_pipeline.load_lora_weights(
-            "Kijai/WanVideo_comfy", 
-            weight_name="Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16.safetensors",
+            fused_lora_path,
             adapter_name="lightx2v"
         )
         
         # Load second LoRA for transformer_2 (low noise expert)
         kwargs_lora = {"load_into_transformer_2": True}
         self.i2v_first_last_pipeline.load_lora_weights(
-            "Kijai/WanVideo_comfy", 
-            weight_name="Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16.safetensors",
+            fused_lora_path,
             adapter_name="lightx2v_2",
             **kwargs_lora
         )
