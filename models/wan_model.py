@@ -117,15 +117,11 @@ class WANModel:
             return  # Already loaded
             
         logger.info("Loading WAN 2.2 T2V model...")
-        
-        # Unload I2V model if it's currently loaded
-        if self.current_model == "i2v":
-            logger.info("Unloading I2V model to free memory...")
-            if self.i2v_pipeline is not None:
-                del self.i2v_pipeline
-                self.i2v_pipeline = None
-            gc.collect()
-            torch.cuda.empty_cache()
+
+        # Always clean up when switching away from any other mode.
+        if self.current_model is not None and self.current_model != "t2v":
+            logger.info(f"Unloading {self.current_model} model to free memory before T2V load...")
+            self._cleanup_memory()
         
         t2v_source = self._resolve_model_source(self.t2v_model_path, self.t2v_model_id)
 
@@ -165,24 +161,10 @@ class WANModel:
             
         logger.info(f"Loading WAN 2.2 I2V model {'with Lightning LoRAs' if use_lightning_loras else 'without LoRAs'}...")
         
-        # Unload T2V model if it's currently loaded
-        if self.current_model == "t2v":
-            logger.info("Unloading T2V model to free memory...")
-            if self.t2v_pipeline is not None:
-                del self.t2v_pipeline
-                self.t2v_pipeline = None
-            # Keep VAE as it might be useful for other operations
-            gc.collect()
-            torch.cuda.empty_cache()
-        
-        # Unload I2V if loaded with different configuration
-        if self.current_model in ["i2v", "i2v_no_lora"] and self.current_model != model_key:
-            logger.info("Unloading I2V model to reload with different configuration...")
-            if self.i2v_pipeline is not None:
-                del self.i2v_pipeline
-                self.i2v_pipeline = None
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Always clean up when switching modes or i2v config.
+        if self.current_model is not None and self.current_model != model_key:
+            logger.info(f"Unloading {self.current_model} model to free memory before I2V load...")
+            self._cleanup_memory()
         
         i2v_source = self._resolve_model_source(self.i2v_model_path, self.i2v_model_id)
 
@@ -234,18 +216,11 @@ class WANModel:
             return  # Already loaded
             
         logger.info("Loading WAN 2.2 I2V model for first-last frame...")
-        
-        # Unload other models if currently loaded
-        if self.current_model in ["t2v", "i2v"]:
-            logger.info(f"Unloading {self.current_model} model to free memory...")
-            if self.current_model == "t2v" and self.t2v_pipeline is not None:
-                del self.t2v_pipeline
-                self.t2v_pipeline = None
-            elif self.current_model == "i2v" and self.i2v_pipeline is not None:
-                del self.i2v_pipeline
-                self.i2v_pipeline = None
-            gc.collect()
-            torch.cuda.empty_cache()
+
+        # Always clean up when switching away from any other mode.
+        if self.current_model is not None and self.current_model != "i2v_first_last":
+            logger.info(f"Unloading {self.current_model} model to free memory before first-last load...")
+            self._cleanup_memory()
         
         i2v_first_last_source = self._resolve_model_source(
             self.i2v_first_last_model_path,
