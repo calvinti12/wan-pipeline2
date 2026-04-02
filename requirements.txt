@@ -41,3 +41,4 @@ git+https://github.com/huggingface/diffusers
 imageio
 imageio-ffmpeg
 runpod
+boto3
