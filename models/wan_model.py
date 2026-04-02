@@ -316,7 +316,10 @@ class WANModel:
         width: int = 720,
         height: int = 1280,  # Vertical format for portrait shots
         num_frames: int = 9,  # Reduced from 81 for faster generation when only extracting frame 0
-        fps: int = 16
+        fps: int = 16,
+        num_inference_steps: int = 40,
+        guidance_scale: float = 4.0,
+        guidance_scale_2: float = 3.0
     ) -> str:
         """
         Generate a video from a text prompt using WAN 2.2 T2V
@@ -347,9 +350,9 @@ class WANModel:
                 height=height,
                 width=width,
                 num_frames=num_frames,
-                guidance_scale=4.0,
-                guidance_scale_2=3.0,
-                num_inference_steps=20,
+                guidance_scale=guidance_scale,
+                guidance_scale_2=guidance_scale_2,
+                num_inference_steps=num_inference_steps,
             ).frames[0]
             
             # Export to video
@@ -363,7 +366,10 @@ class WANModel:
         prompt: str, 
         output_path: str,
         width: int = 720,
-        height: int = 1280  # Vertical format for portrait shots
+        height: int = 1280,  # Vertical format for portrait shots
+        num_inference_steps: int = 40,
+        guidance_scale: float = 4.0,
+        guidance_scale_2: float = 3.0
     ) -> str:
         """
         Generate a single frame from a text prompt using WAN 2.2 T2V with Instagirl lora
@@ -392,9 +398,9 @@ class WANModel:
                 height=height,
                 width=width,
                 num_frames=1,  # Generate only one frame
-                guidance_scale=4.0,
-                guidance_scale_2=3.0,
-                num_inference_steps=20,
+                guidance_scale=guidance_scale,
+                guidance_scale_2=guidance_scale_2,
+                num_inference_steps=num_inference_steps,
             ).frames[0]
             
             # Save the single frame as an image
@@ -420,7 +426,9 @@ class WANModel:
         num_frames: int = 81,
         fps: int = 16,
         resolution: str = "480p",
-        use_lightning_loras: bool = True
+        use_lightning_loras: bool = True,
+        num_inference_steps_override: Optional[int] = None,
+        guidance_scale_override: Optional[float] = None
     ) -> str:
         """
         Generate a video from an image and prompt using WAN 2.2 I2V
@@ -473,6 +481,11 @@ class WANModel:
         else:
             guidance_scale = 1.1  # Standard CFG for base model
             num_inference_steps = 36  # Standard steps for base model
+
+        if num_inference_steps_override is not None:
+            num_inference_steps = int(num_inference_steps_override)
+        if guidance_scale_override is not None:
+            guidance_scale = float(guidance_scale_override)
         
         logger.info(f"Using inference steps: {num_inference_steps}, guidance scale: {guidance_scale}")
         

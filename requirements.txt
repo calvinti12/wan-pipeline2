@@ -11,7 +11,7 @@ numpy==2.2.4
 # Skip xformers for now - it takes too long to compile from source
 # xformers  # Nightly build to match PyTorch nightly - DISABLED due to long compilation
 einops
-transformers==4.46.0
+transformers
 accelerate>=0.25.0  # Required for proper model loading and memory management
 peft>=0.6.0  # Required for LoRA weight loading
 
