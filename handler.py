@@ -44,6 +44,12 @@ FIRST_LAST_PRESET_TO_STEPS = {
     "high": 20,
     "ultra": 28,
 }
+ANIMATE_PRESET_TO_STEPS = {
+    "fast": 12,
+    "balanced": 20,
+    "high": 28,
+    "ultra": 36,
+}
 
 
 def _to_bool(value, default=True):
@@ -84,6 +90,8 @@ def _normalize_mode(value):
         "i2v_first_last": "first_last",
         "t2v": "t2v",
         "text_to_video": "t2v",
+        "animate": "animate",
+        "replace": "replace",
     }
     return aliases.get(mode)
 
@@ -96,13 +104,18 @@ def handler(event):
         if inp.get("aleef") is True:
             return {
                 "service": "wan-pipeline",
-                "version": "phase-3",
+                "version": "phase-5",
                 "status": "serverless-ready",
                 "inputs": [
                     "mode",
                     "img_path",
                     "start_image_path",
                     "end_image_path",
+                    "ref_image_path",
+                    "pose_video_path",
+                    "face_video_path",
+                    "background_video_path",
+                    "mask_video_path",
                     "prompt",
                     "duration_seconds",
                     "resolution",
@@ -116,12 +129,12 @@ def handler(event):
                     "level",
                     "output_prefix",
                 ],
-                "modes": ["image", "i2v", "first_last", "t2v"],
+                "modes": ["image", "i2v", "first_last", "t2v", "animate", "replace"],
             }
 
         mode = _normalize_mode(inp.get("mode"))
         if mode is None:
-            return {"error": "mode must be one of: image, i2v, first_last, t2v"}
+            return {"error": "mode must be one of: image, i2v, first_last, t2v, animate, replace"}
 
         prompt = inp.get("prompt")
         if mode in ("image", "i2v", "t2v") and (not prompt or not isinstance(prompt, str)):
@@ -272,6 +285,82 @@ def handler(event):
                 "duration_seconds": duration_seconds,
                 "quality_preset": quality_preset,
                 "num_inference_steps": num_inference_steps,
+                "seed": seed,
+                "latency_seconds": round(time.time() - t0, 2),
+            }
+
+        if mode in ("animate", "replace"):
+            ref_image_path = inp.get("ref_image_path")
+            pose_video_path = inp.get("pose_video_path")
+            face_video_path = inp.get("face_video_path")
+            if not ref_image_path or not pose_video_path or not face_video_path:
+                return {"error": "ref_image_path, pose_video_path, and face_video_path are required"}
+
+            background_video_path = inp.get("background_video_path")
+            mask_video_path = inp.get("mask_video_path")
+            if mode == "replace" and (not background_video_path or not mask_video_path):
+                return {"error": "replace mode requires background_video_path and mask_video_path"}
+
+            prompt = inp.get("prompt", "People in the video are doing actions.")
+            quality_preset = str(inp.get("quality_preset", "high")).strip().lower()
+            if quality_preset not in ANIMATE_PRESET_TO_STEPS:
+                return {"error": "quality_preset must be one of: fast, balanced, high, ultra"}
+            segment_frame_length = int(inp.get("segment_frame_length", 77))
+            prev_segment_conditioning_frames = int(inp.get("prev_segment_conditioning_frames", 1))
+            num_inference_steps = int(inp.get("num_inference_steps", ANIMATE_PRESET_TO_STEPS[quality_preset]))
+            num_inference_steps = max(8, min(num_inference_steps, 60))
+            guidance_scale = float(inp.get("guidance_scale", 1.0))
+            fps = int(inp.get("fps", 30))
+            seed = inp.get("seed")
+            seed = int(seed) if seed is not None else None
+
+            ref_ext = Path(ref_image_path).suffix or ".png"
+            pose_ext = Path(pose_video_path).suffix or ".mp4"
+            face_ext = Path(face_video_path).suffix or ".mp4"
+            local_ref = os.path.join(workdir, f"ref{ref_ext}")
+            local_pose = os.path.join(workdir, f"pose{pose_ext}")
+            local_face = os.path.join(workdir, f"face{face_ext}")
+            local_bg = os.path.join(workdir, "background.mp4")
+            local_mask = os.path.join(workdir, "mask.mp4")
+            local_output_path = os.path.join(workdir, "output.mp4")
+
+            download_to_local(ref_image_path, local_ref)
+            download_to_local(pose_video_path, local_pose)
+            download_to_local(face_video_path, local_face)
+            if mode == "replace":
+                download_to_local(background_video_path, local_bg)
+                download_to_local(mask_video_path, local_mask)
+
+            model.generate_animate_video(
+                mode=mode,
+                prompt=prompt,
+                ref_image_path=local_ref,
+                pose_video_path=local_pose,
+                face_video_path=local_face,
+                output_path=local_output_path,
+                segment_frame_length=segment_frame_length,
+                prev_segment_conditioning_frames=prev_segment_conditioning_frames,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_inference_steps,
+                fps=fps,
+                seed=seed,
+                background_video_path=local_bg if mode == "replace" else None,
+                mask_video_path=local_mask if mode == "replace" else None,
+            )
+
+            upload_result = upload_video(
+                local_output_path,
+                output_bucket,
+                output_prefix or "video_gen/wan_pipeline_animate",
+            )
+            return {
+                "video_path": upload_result["s3_uri"],
+                "video_url": upload_result["presigned_url"],
+                "mode": mode,
+                "quality_preset": quality_preset,
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+                "fps": fps,
                 "seed": seed,
                 "latency_seconds": round(time.time() - t0, 2),
             }

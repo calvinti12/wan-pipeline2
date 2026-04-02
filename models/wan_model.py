@@ -19,6 +19,7 @@ import safetensors.torch as st
 from PIL import Image
 import cv2
 import numpy as np
+import imageio
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +37,11 @@ class WANModel:
         self.t2v_pipeline = None  # Text-to-Video pipeline
         self.i2v_pipeline = None  # Image-to-Video pipeline
         self.i2v_first_last_pipeline = None  # Image-to-Video First-Last Frame pipeline
+        self.animate_pipeline = None  # Animate-14B pipeline
         self.vae = None
         self.t2v_model_id = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
         self.i2v_model_id = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+        self.animate_model_id = "Wan-AI/Wan2.2-Animate-14B-Diffusers"
         model_root = os.environ.get("MODEL_ROOT", "/runpod-volume/models")
         self.t2v_model_path = os.environ.get(
             "T2V_MODEL_PATH",
@@ -51,6 +54,10 @@ class WANModel:
         self.i2v_first_last_model_path = os.environ.get(
             "I2V_FIRST_LAST_MODEL_PATH",
             self.i2v_model_path,
+        )
+        self.animate_model_path = os.environ.get(
+            "ANIMATE_MODEL_PATH",
+            f"{model_root}/Wan-AI/Wan2.2-Animate-14B-Diffusers",
         )
         self.local_models_only = os.environ.get("WAN_LOCAL_MODELS_ONLY", "1") == "1"
         self.instagirl_lora_path = instagirl_lora_path
@@ -87,6 +94,10 @@ class WANModel:
         if self.i2v_first_last_pipeline is not None:
             del self.i2v_first_last_pipeline
             self.i2v_first_last_pipeline = None
+
+        if self.animate_pipeline is not None:
+            del self.animate_pipeline
+            self.animate_pipeline = None
             
         if self.vae is not None:
             del self.vae
@@ -290,6 +301,105 @@ class WANModel:
         self.current_model = "i2v_first_last"
         
         logger.info(f"I2V first-last frame model loaded. GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+
+    def _load_animate_model(self):
+        """Load Animate-14B pipeline, unloading other models if necessary"""
+        if self.current_model == "animate" and self.animate_pipeline is not None:
+            return
+
+        logger.info("Loading WAN 2.2 Animate-14B model...")
+
+        if self.current_model is not None and self.current_model != "animate":
+            logger.info(f"Unloading {self.current_model} model to free memory...")
+            self._cleanup_memory()
+
+        animate_source = self._resolve_model_source(
+            self.animate_model_path,
+            self.animate_model_id,
+        )
+
+        try:
+            from diffusers import WanAnimatePipeline
+        except Exception as exc:
+            raise RuntimeError(
+                "WanAnimatePipeline is unavailable in current diffusers build."
+            ) from exc
+
+        self.animate_pipeline = WanAnimatePipeline.from_pretrained(
+            animate_source,
+            torch_dtype=self.dtype,
+        )
+        self.animate_pipeline.to(self.device)
+        self.current_model = "animate"
+        logger.info(
+            f"Animate model loaded. GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB"
+        )
+
+    def _load_video_frames(self, video_path: str):
+        frames = []
+        reader = imageio.get_reader(video_path)
+        try:
+            for frame in reader:
+                frames.append(Image.fromarray(frame).convert("RGB"))
+        finally:
+            reader.close()
+        if not frames:
+            raise RuntimeError(f"No frames decoded from video: {video_path}")
+        return frames
+
+    def generate_animate_video(
+        self,
+        mode: str,
+        prompt: str,
+        ref_image_path: str,
+        pose_video_path: str,
+        face_video_path: str,
+        output_path: str,
+        segment_frame_length: int = 77,
+        prev_segment_conditioning_frames: int = 1,
+        guidance_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        fps: int = 30,
+        seed: Optional[int] = None,
+        background_video_path: Optional[str] = None,
+        mask_video_path: Optional[str] = None,
+    ) -> str:
+        self._load_animate_model()
+
+        if mode not in ("animate", "replace"):
+            raise ValueError("mode must be one of: animate, replace")
+
+        image = Image.open(ref_image_path).convert("RGB")
+        pose_video = self._load_video_frames(pose_video_path)
+        face_video = self._load_video_frames(face_video_path)
+
+        if seed is None:
+            seed = torch.randint(0, 2**31 - 1, (1,)).item()
+        generator = torch.Generator(device=self.device).manual_seed(int(seed))
+
+        kwargs = {
+            "image": image,
+            "pose_video": pose_video,
+            "face_video": face_video,
+            "prompt": prompt,
+            "mode": mode,
+            "segment_frame_length": int(segment_frame_length),
+            "prev_segment_conditioning_frames": int(prev_segment_conditioning_frames),
+            "guidance_scale": float(guidance_scale),
+            "num_inference_steps": int(num_inference_steps),
+            "generator": generator,
+        }
+
+        if mode == "replace":
+            if not background_video_path or not mask_video_path:
+                raise ValueError("replace mode requires background_video_path and mask_video_path")
+            kwargs["background_video"] = self._load_video_frames(background_video_path)
+            kwargs["mask_video"] = self._load_video_frames(mask_video_path)
+
+        with torch.no_grad():
+            frames = self.animate_pipeline(**kwargs).frames[0]
+        export_to_video(frames, output_path, fps=int(fps))
+        return output_path
     
     def process_image_for_video(self, image: Image.Image) -> Image.Image:
         """
