@@ -1,0 +1,43 @@
+# Core dependencies first - install with: pip install --extra-index-url https://download.pytorch.org/whl/nightly/cu128 -r requirements.txt
+# PyTorch NIGHTLY with CUDA 12.8+ support for Blackwell GPUs (sm_120)
+--pre
+--extra-index-url https://download.pytorch.org/whl/nightly/cu128
+torch
+torchvision
+torchaudio
+numpy==2.2.4
+
+# ML dependencies that depend on torch
+# Skip xformers for now - it takes too long to compile from source
+# xformers  # Nightly build to match PyTorch nightly - DISABLED due to long compilation
+einops
+transformers==4.46.0
+accelerate>=0.25.0  # Required for proper model loading and memory management
+peft>=0.6.0  # Required for LoRA weight loading
+
+# Web framework
+fastapi>=0.115.2
+uvicorn[standard]==0.24.0
+python-multipart>=0.0.18
+requests>=2.31.0
+
+# Image processing
+Pillow==10.1.0
+opencv-python==4.11.0.86
+
+
+# Video processing is handled by diffusers export_to_video
+
+# General utilities
+tqdm==4.67.1
+
+# Text processing (required by transformers)
+ftfy
+
+# WAN 2.2 T2V and I2V models - requires diffusers main branch
+git+https://github.com/huggingface/diffusers
+
+# Video processing (recommended for better video export)
+imageio
+imageio-ffmpeg
+runpod
