@@ -318,3 +318,7 @@ The API uses a sophisticated job management system:
 -   **GPU Optimization**: Uses PyTorch nightly for latest CUDA optimizations
 -   **Concurrent Requests**: Background job processing supports multiple simultaneous requests
 -   **Storage**: Monitor disk space for job persistence and output files
+
+## Build Trigger
+
+This line is intentionally added to trigger a fresh CI/build deployment after repository sync.
