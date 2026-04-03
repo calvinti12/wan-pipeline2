@@ -110,6 +110,28 @@ class WANModel:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             logger.info(f"GPU memory cleared. Current allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+
+    def _ensure_pipeline_on_device(self, pipeline, pipeline_name: str):
+        """
+        Best-effort guard against mixed CPU/CUDA tensors after dynamic loading/fusion.
+        Some components can end up on CPU after adapter operations.
+        """
+        if pipeline is None:
+            return
+        try:
+            pipeline.to(self.device)
+        except Exception as exc:
+            logger.warning(f"{pipeline_name}: pipeline.to({self.device}) failed: {exc}")
+
+        # Keep component list explicit to avoid touching unrelated objects.
+        for component_name in ("transformer", "transformer_2", "vae", "text_encoder", "text_encoder_2"):
+            component = getattr(pipeline, component_name, None)
+            if component is None:
+                continue
+            try:
+                component.to(self.device)
+            except Exception as exc:
+                logger.warning(f"{pipeline_name}: failed moving {component_name} to {self.device}: {exc}")
     
     def _load_t2v_model(self):
         """Load T2V model and VAE, unloading I2V if necessary"""
@@ -147,6 +169,8 @@ class WANModel:
         if self.instagirl_lora_path:
             logger.info("Loading Instagirl lora...")
             self.t2v_pipeline.load_lora_weights(self.instagirl_lora_path)
+        
+        self._ensure_pipeline_on_device(self.t2v_pipeline, "t2v")
         
         self.current_model = "t2v"
         
@@ -204,6 +228,8 @@ class WANModel:
             logger.info("Using default Wan scheduler for Lightning LoRAs...")
         else:
             logger.info("Skipping LoRA loading - using base model with standard settings...")
+        
+        self._ensure_pipeline_on_device(self.i2v_pipeline, "i2v")
         
         self.current_model = model_key
         
@@ -271,6 +297,7 @@ class WANModel:
             components=["transformer_2"]
         )
         self.i2v_first_last_pipeline.unload_lora_weights()
+        self._ensure_pipeline_on_device(self.i2v_first_last_pipeline, "i2v_first_last")
         logger.info("LoRA fusion completed successfully")
         
         self.current_model = "i2v_first_last"
@@ -305,6 +332,7 @@ class WANModel:
             torch_dtype=self.dtype,
         )
         self.animate_pipeline.to(self.device)
+        self._ensure_pipeline_on_device(self.animate_pipeline, "animate")
         self.current_model = "animate"
         logger.info(
             f"Animate model loaded. GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB"
@@ -469,6 +497,7 @@ class WANModel:
         # Define negative prompt (from WAN example)
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
         
+        self._ensure_pipeline_on_device(self.t2v_pipeline, "t2v_generate_video")
         with torch.no_grad():
             output = self.t2v_pipeline(
                 prompt=prompt,
@@ -517,6 +546,7 @@ class WANModel:
         # Define negative prompt (from WAN example)
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
         
+        self._ensure_pipeline_on_device(self.t2v_pipeline, "t2v_generate_image")
         with torch.no_grad():
             output = self.t2v_pipeline(
                 prompt=prompt,
@@ -615,6 +645,7 @@ class WANModel:
         
         logger.info(f"Using inference steps: {num_inference_steps}, guidance scale: {guidance_scale}")
         
+        self._ensure_pipeline_on_device(self.i2v_pipeline, "i2v_generate_video")
         with torch.no_grad():
             output = self.i2v_pipeline(
                 image=image,
@@ -705,6 +736,7 @@ class WANModel:
         # Define negative prompt (from WAN example)
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走,过曝，"
         
+        self._ensure_pipeline_on_device(self.i2v_first_last_pipeline, "i2v_first_last_generate")
         with torch.no_grad():
             output = self.i2v_first_last_pipeline(
                 prompt=prompt,
