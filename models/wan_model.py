@@ -14,7 +14,7 @@ from pathlib import Path
 from diffusers import WanPipeline, WanImageToVideoPipeline, AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
 from diffusers.utils import export_to_video, load_image
 from diffusers.loaders.lora_conversion_utils import _convert_non_diffusers_wan_lora_to_diffusers
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 import safetensors.torch as st
 from PIL import Image
 import cv2
@@ -78,8 +78,22 @@ class WANModel:
                 f"Local model missing at {local_path}. "
                 "Set up persistent models or set WAN_LOCAL_MODELS_ONLY=0 to allow HF download fallback."
             )
-        logger.warning(f"Local model not found at {local_path}, falling back to HF model id: {hf_model_id}")
-        return hf_model_id
+        logger.warning(
+            f"Local model not found at {local_path}. "
+            f"Downloading {hf_model_id} into persistent path."
+        )
+        Path(local_path).mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo_id=hf_model_id,
+            local_dir=local_path,
+        )
+        if local_model_index.exists():
+            logger.info(f"Model download completed at: {local_path}")
+            return local_path
+        raise RuntimeError(
+            f"Model download did not produce model_index.json at {local_model_index}. "
+            f"Please verify repo {hf_model_id} and storage permissions."
+        )
         
     def _cleanup_memory(self):
         """Clean up GPU memory by unloading models and running garbage collection"""
