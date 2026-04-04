@@ -14,7 +14,7 @@ from pathlib import Path
 from diffusers import WanPipeline, WanImageToVideoPipeline, AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
 from diffusers.utils import export_to_video, load_image
 from diffusers.loaders.lora_conversion_utils import _convert_non_diffusers_wan_lora_to_diffusers
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download
 import safetensors.torch as st
 from PIL import Image
 import cv2
@@ -78,22 +78,8 @@ class WANModel:
                 f"Local model missing at {local_path}. "
                 "Set up persistent models or set WAN_LOCAL_MODELS_ONLY=0 to allow HF download fallback."
             )
-        logger.warning(
-            f"Local model not found at {local_path}. "
-            f"Downloading {hf_model_id} into persistent path."
-        )
-        Path(local_path).mkdir(parents=True, exist_ok=True)
-        snapshot_download(
-            repo_id=hf_model_id,
-            local_dir=local_path,
-        )
-        if local_model_index.exists():
-            logger.info(f"Model download completed at: {local_path}")
-            return local_path
-        raise RuntimeError(
-            f"Model download did not produce model_index.json at {local_model_index}. "
-            f"Please verify repo {hf_model_id} and storage permissions."
-        )
+        logger.warning(f"Local model not found at {local_path}, falling back to HF model id: {hf_model_id}")
+        return hf_model_id
         
     def _cleanup_memory(self):
         """Clean up GPU memory by unloading models and running garbage collection"""
@@ -124,64 +110,6 @@ class WANModel:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             logger.info(f"GPU memory cleared. Current allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
-
-    def _ensure_pipeline_on_device(self, pipeline, pipeline_name: str):
-        """
-        Best-effort guard against mixed CPU/CUDA tensors after dynamic loading/fusion.
-        Some components can end up on CPU after adapter operations.
-        """
-        if pipeline is None:
-            return
-        try:
-            pipeline.to(self.device)
-        except Exception as exc:
-            logger.warning(f"{pipeline_name}: pipeline.to({self.device}) failed: {exc}")
-
-        # Keep component list explicit to avoid touching unrelated objects.
-        for component_name in ("transformer", "transformer_2", "vae", "text_encoder", "text_encoder_2"):
-            component = getattr(pipeline, component_name, None)
-            if component is None:
-                continue
-            try:
-                component.to(self.device)
-            except Exception as exc:
-                logger.warning(f"{pipeline_name}: failed moving {component_name} to {self.device}: {exc}")
-
-    def _move_scheduler_state_to_device(self, scheduler, scheduler_name: str):
-        """
-        Scheduler state can retain CPU tensors between invocations in long-lived workers.
-        Move any cached tensors/lists of tensors onto the active device.
-        """
-        if scheduler is None:
-            return
-        for attr_name, value in vars(scheduler).items():
-            try:
-                if torch.is_tensor(value):
-                    setattr(scheduler, attr_name, value.to(self.device))
-                elif isinstance(value, list):
-                    moved = [v.to(self.device) if torch.is_tensor(v) else v for v in value]
-                    setattr(scheduler, attr_name, moved)
-                elif isinstance(value, tuple):
-                    moved = tuple(v.to(self.device) if torch.is_tensor(v) else v for v in value)
-                    setattr(scheduler, attr_name, moved)
-            except Exception as exc:
-                logger.warning(f"{scheduler_name}: failed moving scheduler state '{attr_name}' to {self.device}: {exc}")
-
-    def _refresh_pipeline_scheduler(self, pipeline, pipeline_name: str):
-        """
-        Recreate scheduler from config per invocation to avoid stale internal state
-        (e.g. cached model outputs on CPU causing CUDA/CPU stack mismatches).
-        """
-        if pipeline is None or getattr(pipeline, "scheduler", None) is None:
-            return
-        try:
-            scheduler_cls = pipeline.scheduler.__class__
-            scheduler_config = pipeline.scheduler.config
-            pipeline.scheduler = scheduler_cls.from_config(scheduler_config)
-            logger.info(f"{pipeline_name}: scheduler reset from config")
-        except Exception as exc:
-            logger.warning(f"{pipeline_name}: scheduler reset failed, using existing scheduler: {exc}")
-        self._move_scheduler_state_to_device(getattr(pipeline, "scheduler", None), f"{pipeline_name}_scheduler")
     
     def _load_t2v_model(self):
         """Load T2V model and VAE, unloading I2V if necessary"""
@@ -219,8 +147,6 @@ class WANModel:
         if self.instagirl_lora_path:
             logger.info("Loading Instagirl lora...")
             self.t2v_pipeline.load_lora_weights(self.instagirl_lora_path)
-        
-        self._ensure_pipeline_on_device(self.t2v_pipeline, "t2v")
         
         self.current_model = "t2v"
         
@@ -278,8 +204,6 @@ class WANModel:
             logger.info("Using default Wan scheduler for Lightning LoRAs...")
         else:
             logger.info("Skipping LoRA loading - using base model with standard settings...")
-        
-        self._ensure_pipeline_on_device(self.i2v_pipeline, "i2v")
         
         self.current_model = model_key
         
@@ -347,7 +271,6 @@ class WANModel:
             components=["transformer_2"]
         )
         self.i2v_first_last_pipeline.unload_lora_weights()
-        self._ensure_pipeline_on_device(self.i2v_first_last_pipeline, "i2v_first_last")
         logger.info("LoRA fusion completed successfully")
         
         self.current_model = "i2v_first_last"
@@ -382,7 +305,6 @@ class WANModel:
             torch_dtype=self.dtype,
         )
         self.animate_pipeline.to(self.device)
-        self._ensure_pipeline_on_device(self.animate_pipeline, "animate")
         self.current_model = "animate"
         logger.info(
             f"Animate model loaded. GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB"
@@ -547,8 +469,6 @@ class WANModel:
         # Define negative prompt (from WAN example)
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
         
-        self._ensure_pipeline_on_device(self.t2v_pipeline, "t2v_generate_video")
-        self._refresh_pipeline_scheduler(self.t2v_pipeline, "t2v_generate_video")
         with torch.no_grad():
             output = self.t2v_pipeline(
                 prompt=prompt,
@@ -597,8 +517,6 @@ class WANModel:
         # Define negative prompt (from WAN example)
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
         
-        self._ensure_pipeline_on_device(self.t2v_pipeline, "t2v_generate_image")
-        self._refresh_pipeline_scheduler(self.t2v_pipeline, "t2v_generate_image")
         with torch.no_grad():
             output = self.t2v_pipeline(
                 prompt=prompt,
@@ -697,8 +615,6 @@ class WANModel:
         
         logger.info(f"Using inference steps: {num_inference_steps}, guidance scale: {guidance_scale}")
         
-        self._ensure_pipeline_on_device(self.i2v_pipeline, "i2v_generate_video")
-        self._refresh_pipeline_scheduler(self.i2v_pipeline, "i2v_generate_video")
         with torch.no_grad():
             output = self.i2v_pipeline(
                 image=image,
@@ -789,7 +705,6 @@ class WANModel:
         # Define negative prompt (from WAN example)
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走,过曝，"
         
-        self._ensure_pipeline_on_device(self.i2v_first_last_pipeline, "i2v_first_last_generate")
         with torch.no_grad():
             output = self.i2v_first_last_pipeline(
                 prompt=prompt,
