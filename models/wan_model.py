@@ -110,7 +110,56 @@ class WANModel:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             logger.info(f"GPU memory cleared. Current allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
-    
+
+    def _move_scheduler_state_to_device(self, scheduler, scheduler_name: str = "scheduler") -> None:
+        """
+        UniPC / multistep schedulers cache tensors (sigmas, rks, etc.) that can stay on CPU
+        after pipeline.to(cuda), causing 'Expected all tensors to be on the same device' in
+        scheduler.step on warm RunPod workers. Move all tensor state to the active device.
+        """
+        if scheduler is None:
+            return
+        dev = torch.device(self.device)
+        try:
+            if hasattr(scheduler, "to"):
+                scheduler.to(dev)
+        except Exception as exc:
+            logger.warning("%s: scheduler.to(%s) failed: %s", scheduler_name, dev, exc)
+        try:
+            for attr_name, value in list(vars(scheduler).items()):
+                try:
+                    if torch.is_tensor(value):
+                        setattr(scheduler, attr_name, value.to(dev))
+                    elif isinstance(value, list):
+                        setattr(
+                            scheduler,
+                            attr_name,
+                            [
+                                v.to(dev) if torch.is_tensor(v) else v
+                                for v in value
+                            ],
+                        )
+                    elif isinstance(value, tuple):
+                        setattr(
+                            scheduler,
+                            attr_name,
+                            tuple(
+                                v.to(dev) if torch.is_tensor(v) else v
+                                for v in value
+                            ),
+                        )
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.warning("%s: partial scheduler state sync failed: %s", scheduler_name, exc)
+
+    def _sync_t2v_scheduler(self) -> None:
+        if self.t2v_pipeline is None:
+            return
+        self._move_scheduler_state_to_device(
+            self.t2v_pipeline.scheduler, "t2v.scheduler"
+        )
+
     def _load_t2v_model(self):
         """Load T2V model and VAE, unloading I2V if necessary"""
         if self.current_model == "t2v" and self.t2v_pipeline is not None:
@@ -142,12 +191,14 @@ class WANModel:
             torch_dtype=self.dtype
         )
         self.t2v_pipeline.to(self.device)
-        
+        self._sync_t2v_scheduler()
+
         # Load Instagirl lora for T2V if path is provided
         if self.instagirl_lora_path:
             logger.info("Loading Instagirl lora...")
             self.t2v_pipeline.load_lora_weights(self.instagirl_lora_path)
-        
+            self._sync_t2v_scheduler()
+
         self.current_model = "t2v"
         
         logger.info(f"T2V model loaded. GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
@@ -468,7 +519,9 @@ class WANModel:
         
         # Define negative prompt (from WAN example)
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
-        
+
+        self._sync_t2v_scheduler()
+
         with torch.no_grad():
             output = self.t2v_pipeline(
                 prompt=prompt,
@@ -516,7 +569,9 @@ class WANModel:
         
         # Define negative prompt (from WAN example)
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
-        
+
+        self._sync_t2v_scheduler()
+
         with torch.no_grad():
             output = self.t2v_pipeline(
                 prompt=prompt,
