@@ -160,6 +160,50 @@ class WANModel:
             self.t2v_pipeline.scheduler, "t2v.scheduler"
         )
 
+    def _patch_unipc_sigmas_inference_device(self) -> None:
+        """
+        diffusers UniPCMultistepScheduler.set_timesteps ends with
+        ``self.sigmas = self.sigmas.to("cpu")`` (to limit host/device copies), but
+        ``multistep_uni_p_bh_update`` builds ``rk`` from CPU ``sigmas`` while
+        appending ``torch.ones(..., device=sample.device)`` on CUDA, so
+        ``torch.stack(rks)`` raises a device mismatch.
+
+        After each ``set_timesteps(..., device=cuda)``, move ``sigmas`` back to
+        that device so ``rk`` tensors match the trailing ones tensor.
+        """
+        if self.t2v_pipeline is None:
+            return
+        try:
+            from diffusers.schedulers.scheduling_unipc_multistep import (
+                UniPCMultistepScheduler,
+            )
+        except ImportError:
+            return
+
+        sched = self.t2v_pipeline.scheduler
+        if not isinstance(sched, UniPCMultistepScheduler):
+            return
+        if getattr(sched, "_wan_unipc_sigmas_patch", None) is not None:
+            return
+
+        orig_set_timesteps = sched.set_timesteps
+
+        def set_timesteps_fixed(*args, **kwargs):
+            result = orig_set_timesteps(*args, **kwargs)
+            device = kwargs.get("device")
+            if device is None and len(args) >= 2:
+                device = args[1]
+            if device is not None:
+                d = device if isinstance(device, torch.device) else torch.device(
+                    device
+                )
+                if d.type in ("cuda", "mps"):
+                    sched.sigmas = sched.sigmas.to(d)
+            return result
+
+        sched.set_timesteps = set_timesteps_fixed
+        sched._wan_unipc_sigmas_patch = True
+
     def _load_t2v_model(self):
         """Load T2V model and VAE, unloading I2V if necessary"""
         if self.current_model == "t2v" and self.t2v_pipeline is not None:
@@ -198,6 +242,8 @@ class WANModel:
             logger.info("Loading Instagirl lora...")
             self.t2v_pipeline.load_lora_weights(self.instagirl_lora_path)
             self._sync_t2v_scheduler()
+
+        self._patch_unipc_sigmas_inference_device()
 
         self.current_model = "t2v"
         
