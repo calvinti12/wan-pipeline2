@@ -2,6 +2,12 @@
 
 A FastAPI server for generating images and videos using WAN 2.2 Text-to-Video (T2V) and Image-to-Video (I2V) models with Instagirl LoRA integration.
 
+## Deployment (RunPod Serverless)
+
+- **RunPod build:** Use `Dockerfile` + `handler.py` as the worker entrypoint. Full API contract, S3, and env vars are documented in **[README_RUNPOD.md](README_RUNPOD.md)**.
+- **Redeploy:** Pushing to `main` on the connected Git remote triggers your pipeline (e.g. RunPod Hub / CI) to rebuild and roll out a new image when that integration is enabled.
+- **Recent image note:** UniPC scheduler keeps `sigmas` on the inference device (CUDA/MPS) after `set_timesteps` to avoid CPU/GPU tensor mismatch during T2V single-frame / image generation.
+
 ## Pipeline Overview
 
 The media generation pipeline supports three main workflows:
