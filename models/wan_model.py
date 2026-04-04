@@ -146,6 +146,42 @@ class WANModel:
                 component.to(self.device)
             except Exception as exc:
                 logger.warning(f"{pipeline_name}: failed moving {component_name} to {self.device}: {exc}")
+
+    def _move_scheduler_state_to_device(self, scheduler, scheduler_name: str):
+        """
+        Scheduler state can retain CPU tensors between invocations in long-lived workers.
+        Move any cached tensors/lists of tensors onto the active device.
+        """
+        if scheduler is None:
+            return
+        for attr_name, value in vars(scheduler).items():
+            try:
+                if torch.is_tensor(value):
+                    setattr(scheduler, attr_name, value.to(self.device))
+                elif isinstance(value, list):
+                    moved = [v.to(self.device) if torch.is_tensor(v) else v for v in value]
+                    setattr(scheduler, attr_name, moved)
+                elif isinstance(value, tuple):
+                    moved = tuple(v.to(self.device) if torch.is_tensor(v) else v for v in value)
+                    setattr(scheduler, attr_name, moved)
+            except Exception as exc:
+                logger.warning(f"{scheduler_name}: failed moving scheduler state '{attr_name}' to {self.device}: {exc}")
+
+    def _refresh_pipeline_scheduler(self, pipeline, pipeline_name: str):
+        """
+        Recreate scheduler from config per invocation to avoid stale internal state
+        (e.g. cached model outputs on CPU causing CUDA/CPU stack mismatches).
+        """
+        if pipeline is None or getattr(pipeline, "scheduler", None) is None:
+            return
+        try:
+            scheduler_cls = pipeline.scheduler.__class__
+            scheduler_config = pipeline.scheduler.config
+            pipeline.scheduler = scheduler_cls.from_config(scheduler_config)
+            logger.info(f"{pipeline_name}: scheduler reset from config")
+        except Exception as exc:
+            logger.warning(f"{pipeline_name}: scheduler reset failed, using existing scheduler: {exc}")
+        self._move_scheduler_state_to_device(getattr(pipeline, "scheduler", None), f"{pipeline_name}_scheduler")
     
     def _load_t2v_model(self):
         """Load T2V model and VAE, unloading I2V if necessary"""
@@ -512,6 +548,7 @@ class WANModel:
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
         
         self._ensure_pipeline_on_device(self.t2v_pipeline, "t2v_generate_video")
+        self._refresh_pipeline_scheduler(self.t2v_pipeline, "t2v_generate_video")
         with torch.no_grad():
             output = self.t2v_pipeline(
                 prompt=prompt,
@@ -561,6 +598,7 @@ class WANModel:
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
         
         self._ensure_pipeline_on_device(self.t2v_pipeline, "t2v_generate_image")
+        self._refresh_pipeline_scheduler(self.t2v_pipeline, "t2v_generate_image")
         with torch.no_grad():
             output = self.t2v_pipeline(
                 prompt=prompt,
@@ -660,6 +698,7 @@ class WANModel:
         logger.info(f"Using inference steps: {num_inference_steps}, guidance scale: {guidance_scale}")
         
         self._ensure_pipeline_on_device(self.i2v_pipeline, "i2v_generate_video")
+        self._refresh_pipeline_scheduler(self.i2v_pipeline, "i2v_generate_video")
         with torch.no_grad():
             output = self.i2v_pipeline(
                 image=image,
