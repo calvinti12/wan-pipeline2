@@ -14,7 +14,7 @@ from pathlib import Path
 from diffusers import WanPipeline, WanImageToVideoPipeline, AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
 from diffusers.utils import export_to_video, load_image
 from diffusers.loaders.lora_conversion_utils import _convert_non_diffusers_wan_lora_to_diffusers
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 import safetensors.torch as st
 from PIL import Image
 import cv2
@@ -78,9 +78,23 @@ class WANModel:
                 f"Local model missing at {local_path}. "
                 "Set up persistent models or set WAN_LOCAL_MODELS_ONLY=0 to allow HF download fallback."
             )
-        logger.warning(f"Local model not found at {local_path}, falling back to HF model id: {hf_model_id}")
-        return hf_model_id
-        
+        logger.warning(
+            f"Local model not found at {local_path}. "
+            f"Downloading {hf_model_id} into persistent path."
+        )
+        Path(local_path).mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo_id=hf_model_id,
+            local_dir=local_path,
+        )
+        if local_model_index.exists():
+            logger.info(f"Model download completed at: {local_path}")
+            return local_path
+        raise RuntimeError(
+            f"Model download did not produce model_index.json at {local_model_index}. "
+            f"Please verify repo {hf_model_id} and storage permissions."
+        )
+
     def _cleanup_memory(self):
         """Clean up GPU memory by unloading models and running garbage collection"""
         if self.t2v_pipeline is not None:
@@ -160,35 +174,34 @@ class WANModel:
             self.t2v_pipeline.scheduler, "t2v.scheduler"
         )
 
-    def _patch_unipc_sigmas_inference_device(self) -> None:
+    def _sync_i2v_scheduler(self) -> None:
+        if self.i2v_pipeline is None:
+            return
+        self._move_scheduler_state_to_device(
+            self.i2v_pipeline.scheduler, "i2v.scheduler"
+        )
+
+    def _patch_scheduler_sigmas_for_inference_device(self, scheduler) -> None:
         """
-        diffusers UniPCMultistepScheduler.set_timesteps ends with
-        ``self.sigmas = self.sigmas.to("cpu")`` (to limit host/device copies), but
-        ``multistep_uni_p_bh_update`` builds ``rk`` from CPU ``sigmas`` while
-        appending ``torch.ones(..., device=sample.device)`` on CUDA, so
-        ``torch.stack(rks)`` raises a device mismatch.
+        diffusers UniPC (and similar) schedulers may end set_timesteps with
+        ``self.sigmas = self.sigmas.to("cpu")``, while sampling builds tensors on
+        the sample device, so ``torch.stack`` / ``torch.cat`` in the scheduler
+        step can mix CPU and CUDA. After each ``set_timesteps(..., device=cuda)``,
+        move ``sigmas`` back to that inference device.
 
-        After each ``set_timesteps(..., device=cuda)``, move ``sigmas`` back to
-        that device so ``rk`` tensors match the trailing ones tensor.
+        Uses duck-typing (set_timesteps + sigmas) so wrapped scheduler classes
+        or future diffusers builds still get the fix without isinstance checks.
         """
-        if self.t2v_pipeline is None:
+        if scheduler is None:
             return
-        try:
-            from diffusers.schedulers.scheduling_unipc_multistep import (
-                UniPCMultistepScheduler,
-            )
-        except ImportError:
+        if getattr(scheduler, "_wan_sigmas_device_patched", False):
+            return
+        if not hasattr(scheduler, "set_timesteps") or not hasattr(scheduler, "sigmas"):
             return
 
-        sched = self.t2v_pipeline.scheduler
-        if not isinstance(sched, UniPCMultistepScheduler):
-            return
-        if getattr(sched, "_wan_unipc_sigmas_patch", None) is not None:
-            return
+        orig_set_timesteps = scheduler.set_timesteps
 
-        orig_set_timesteps = sched.set_timesteps
-
-        def set_timesteps_fixed(*args, **kwargs):
+        def set_timesteps_wrapped(*args, **kwargs):
             result = orig_set_timesteps(*args, **kwargs)
             device = kwargs.get("device")
             if device is None and len(args) >= 2:
@@ -197,16 +210,19 @@ class WANModel:
                 d = device if isinstance(device, torch.device) else torch.device(
                     device
                 )
-                if d.type in ("cuda", "mps"):
-                    sched.sigmas = sched.sigmas.to(d)
+                if d.type in ("cuda", "mps") and getattr(scheduler, "sigmas", None) is not None:
+                    scheduler.sigmas = scheduler.sigmas.to(d)
             return result
 
-        sched.set_timesteps = set_timesteps_fixed
-        sched._wan_unipc_sigmas_patch = True
+        scheduler.set_timesteps = set_timesteps_wrapped
+        scheduler._wan_sigmas_device_patched = True
 
     def _load_t2v_model(self):
         """Load T2V model and VAE, unloading I2V if necessary"""
         if self.current_model == "t2v" and self.t2v_pipeline is not None:
+            self._patch_scheduler_sigmas_for_inference_device(
+                self.t2v_pipeline.scheduler
+            )
             return  # Already loaded
             
         logger.info("Loading WAN 2.2 T2V model...")
@@ -243,7 +259,9 @@ class WANModel:
             self.t2v_pipeline.load_lora_weights(self.instagirl_lora_path)
             self._sync_t2v_scheduler()
 
-        self._patch_unipc_sigmas_inference_device()
+        self._patch_scheduler_sigmas_for_inference_device(
+            self.t2v_pipeline.scheduler
+        )
 
         self.current_model = "t2v"
         
@@ -254,6 +272,10 @@ class WANModel:
         # Check if already loaded with correct configuration
         model_key = "i2v" if use_lightning_loras else "i2v_no_lora"
         if self.current_model == model_key and self.i2v_pipeline is not None:
+            self._patch_scheduler_sigmas_for_inference_device(
+                self.i2v_pipeline.scheduler
+            )
+            self._sync_i2v_scheduler()
             return  # Already loaded
             
         logger.info(f"Loading WAN 2.2 I2V model {'with Lightning LoRAs' if use_lightning_loras else 'without LoRAs'}...")
@@ -301,7 +323,12 @@ class WANModel:
             logger.info("Using default Wan scheduler for Lightning LoRAs...")
         else:
             logger.info("Skipping LoRA loading - using base model with standard settings...")
-        
+
+        self._sync_i2v_scheduler()
+        self._patch_scheduler_sigmas_for_inference_device(
+            self.i2v_pipeline.scheduler
+        )
+
         self.current_model = model_key
         
         lora_status = "with Lightning LoRAs" if use_lightning_loras else "without LoRAs"
@@ -310,6 +337,9 @@ class WANModel:
     def _load_i2v_first_last_model(self):
         """Load I2V model for first-last frame with fused Lightning LoRAs"""
         if self.current_model == "i2v_first_last" and self.i2v_first_last_pipeline is not None:
+            self._patch_scheduler_sigmas_for_inference_device(
+                self.i2v_first_last_pipeline.scheduler
+            )
             return  # Already loaded
             
         logger.info("Loading WAN 2.2 I2V model for first-last frame...")
@@ -331,7 +361,13 @@ class WANModel:
             torch_dtype=self.dtype
         )
         self.i2v_first_last_pipeline.to(self.device)
-        
+        self._move_scheduler_state_to_device(
+            self.i2v_first_last_pipeline.scheduler, "i2v_first_last.scheduler"
+        )
+        self._patch_scheduler_sigmas_for_inference_device(
+            self.i2v_first_last_pipeline.scheduler
+        )
+
         # Load and fuse Lightning LoRA adapters following HF Space configuration
         logger.info("Loading/fusing Lightning LoRA adapters...")
         fused_lora_path = hf_hub_download(
@@ -377,6 +413,9 @@ class WANModel:
     def _load_animate_model(self):
         """Load Animate-14B pipeline, unloading other models if necessary"""
         if self.current_model == "animate" and self.animate_pipeline is not None:
+            self._patch_scheduler_sigmas_for_inference_device(
+                self.animate_pipeline.scheduler
+            )
             return
 
         logger.info("Loading WAN 2.2 Animate-14B model...")
@@ -402,6 +441,12 @@ class WANModel:
             torch_dtype=self.dtype,
         )
         self.animate_pipeline.to(self.device)
+        self._move_scheduler_state_to_device(
+            self.animate_pipeline.scheduler, "animate.scheduler"
+        )
+        self._patch_scheduler_sigmas_for_inference_device(
+            self.animate_pipeline.scheduler
+        )
         self.current_model = "animate"
         logger.info(
             f"Animate model loaded. GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB"
@@ -437,6 +482,12 @@ class WANModel:
         mask_video_path: Optional[str] = None,
     ) -> str:
         self._load_animate_model()
+        self._patch_scheduler_sigmas_for_inference_device(
+            self.animate_pipeline.scheduler
+        )
+        self._move_scheduler_state_to_device(
+            self.animate_pipeline.scheduler, "animate.scheduler"
+        )
 
         if mode not in ("animate", "replace"):
             raise ValueError("mode must be one of: animate, replace")
@@ -566,6 +617,9 @@ class WANModel:
         # Define negative prompt (from WAN example)
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 
+        self._patch_scheduler_sigmas_for_inference_device(
+            self.t2v_pipeline.scheduler
+        )
         self._sync_t2v_scheduler()
 
         with torch.no_grad():
@@ -616,6 +670,9 @@ class WANModel:
         # Define negative prompt (from WAN example)
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 
+        self._patch_scheduler_sigmas_for_inference_device(
+            self.t2v_pipeline.scheduler
+        )
         self._sync_t2v_scheduler()
 
         with torch.no_grad():
@@ -715,6 +772,11 @@ class WANModel:
             guidance_scale = float(guidance_scale_override)
         
         logger.info(f"Using inference steps: {num_inference_steps}, guidance scale: {guidance_scale}")
+
+        self._patch_scheduler_sigmas_for_inference_device(
+            self.i2v_pipeline.scheduler
+        )
+        self._sync_i2v_scheduler()
         
         with torch.no_grad():
             output = self.i2v_pipeline(
@@ -802,7 +864,10 @@ class WANModel:
         self.i2v_first_last_pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
             self.i2v_first_last_pipeline.scheduler.config, shift=shift
         )
-        
+        self._patch_scheduler_sigmas_for_inference_device(
+            self.i2v_first_last_pipeline.scheduler
+        )
+
         # Define negative prompt (from WAN example)
         negative_prompt = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走,过曝，"
         
